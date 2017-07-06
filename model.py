@@ -6,6 +6,17 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 
 
+def to_scalar(var):
+    # returns a python float
+    return var.view(-1).data.tolist()[0]
+
+
+def argmax(vec):
+    # return the argmax as a python int
+    _, idx = torch.max(vec, 1)
+    return to_scalar(idx)
+
+
 def log_sum_exp(vec, dim=0):
     _, idx = torch.max(vec, dim)
     max = torch.gather(vec, dim, idx[..., 0].unsqueeze(-1))
@@ -25,7 +36,6 @@ class CRF(nn.Module):
 
     def reset_parameters(self):
         I.xavier_normal(self.transitions.data)
-        self.transitions.data = -self.transitions.data
 
     def forward(self, logits, lens):
         """
@@ -41,8 +51,10 @@ class CRF(nn.Module):
 
         logits_t = logits.transpose(1, 0)
         for logit in logits_t:
-            logit_exp = logit.unsqueeze(-1).expand(batch_size, *self.transitions.size())
-            alpha_exp = alpha.unsqueeze(1).expand(batch_size, *self.transitions.size())
+            logit_exp = logit.unsqueeze(-1).expand(batch_size,
+                                                   *self.transitions.size())
+            alpha_exp = alpha.unsqueeze(1).expand(batch_size,
+                                                  *self.transitions.size())
             trans_exp = self.transitions.unsqueeze(0).expand_as(alpha_exp)
             mat = logit_exp + trans_exp + alpha_exp
             alpha_nxt = log_sum_exp(mat, 2)
@@ -128,9 +140,11 @@ class CRF(nn.Module):
 
         # obtain transition vector for each label in batch and timestep
         # (except the last ones)
-        transitions_exp = transitions.unsqueeze(0).expand(batch_size, *transitions.size())
+        transitions_exp = transitions.unsqueeze(0).expand(batch_size,
+                                                          *transitions.size())
         labels_l = labels[:, :-1]
-        labels_lexp = labels_l.unsqueeze(-1).expand(*labels_l.size(), transitions.size(0))
+        labels_lexp = labels_l.unsqueeze(-1).expand(*labels_l.size(),
+                                                    transitions.size(0))
         transition_rows = torch.gather(transitions_exp, 1, labels_lexp)
 
         # obtain transition score from the transition vector for each label
@@ -147,21 +161,28 @@ class CRF(nn.Module):
 
 
 class BiLSTMCRF(nn.Module):
-    def __init__(self, word_vocab, label_vocab, word_dim, hidden_dim,
+    def __init__(self, word_vocabs, label_vocab, word_dims, hidden_dim,
                  dropout_prob):
         super(BiLSTMCRF, self).__init__()
 
-        self.word_vocab = word_vocab
+        assert len(word_vocabs) == len(word_dims)
+
+        self.n_feats = len(word_vocabs)
+        self.word_dim = sum(word_dims)
+        self.word_vocabs = word_vocabs
         self.label_vocab = label_vocab
-        self.word_dim = word_dim
+        self.word_dims = word_dims
         self.hidden_dim = hidden_dim
         self.dropout_prob = dropout_prob
         self.is_cuda = False
 
         self.n_labels = n_labels = len(label_vocab)
 
-        self.embeddings = nn.Embedding(len(word_vocab), word_dim)
-        self.input_layer = nn.Linear(word_dim, hidden_dim)
+        for i, (word_vocab, word_dim) in enumerate(zip(word_vocabs, word_dims)):
+            setattr(self, "embeddings_{}".format(i),
+                    nn.Embedding(len(word_vocab), word_dim))
+
+        self.input_layer = nn.Linear(self.word_dim, hidden_dim)
         self.output_layer = nn.Linear(hidden_dim * 2, n_labels)
         self.crf = CRF(label_vocab)
         self.lstm = nn.LSTM(input_size=hidden_dim,
@@ -182,7 +203,10 @@ class BiLSTMCRF(nn.Module):
         return ret
 
     def reset_parameters(self):
-        I.xavier_normal(self.embeddings.weight.data)
+        for i in range(self.n_feats):
+            embeddings = getattr(self, "embeddings_{}".format(i))
+            I.xavier_normal(embeddings.weight.data)
+
         I.xavier_normal(self.input_layer.weight.data)
         self.crf.reset_parameters()
         self.lstm.reset_parameters()
@@ -200,10 +224,34 @@ class BiLSTMCRF(nn.Module):
 
         return output, h
 
-    def _forward_bilstm(self, x, lens):
-        batch_size, seq_len = x.size()
+    def _embeddings(self, xs):
+        """Takes raw feature sequences and produces a single word embedding
 
-        x = self.embeddings(x)
+        Arguments:
+            xs: [n_feats, batch_size, seq_len] LongTensor
+
+        Returns:
+            [batch_size, seq_len, word_dim] FloatTensor 
+        """
+        n_feats, batch_size, seq_len = xs.size()
+
+        assert n_feats == self.n_feats
+
+        res = []
+        for i, x in enumerate(xs):
+            embeddings = getattr(self, "embeddings_{}".format(i))
+
+            x = embeddings(x)
+            res.append(x)
+
+        x = torch.cat(res, 2)
+
+        return x
+
+    def _forward_bilstm(self, xs, lens):
+        n_feats, batch_size, seq_len = xs.size()
+
+        x = self._embeddings(xs)
         x = x.view(-1, self.word_dim)
         x = F.tanh(self.input_layer(x))
         x = x.view(batch_size, seq_len, self.hidden_dim)
@@ -212,7 +260,7 @@ class BiLSTMCRF(nn.Module):
 
         o = o.contiguous()
         o = o.view(-1, self.hidden_dim * 2)
-        o = F.tanh(self.output_layer(o))
+        o = self.output_layer(o)
         o = o.view(batch_size, seq_len, self.n_labels)
         return o
 
@@ -225,9 +273,9 @@ class BiLSTMCRF(nn.Module):
 
         return score
 
-    def score(self, x, y, lens, logits=None):
+    def score(self, xs, y, lens, logits=None):
         if logits is None:
-            logits = self._forward_bilstm(x, lens)
+            logits = self._forward_bilstm(xs, lens)
 
         transition_score = self.crf.transition_score(y, lens)
         bilstm_score = self._bilstm_score(logits, y, lens)
@@ -236,13 +284,13 @@ class BiLSTMCRF(nn.Module):
 
         return score
 
-    def loglik(self, x, y, lens):
-        logits = self._forward_bilstm(x, lens)
+    def loglik(self, xs, y, lens):
+        logits = self._forward_bilstm(xs, lens)
         forward_score = self.crf(logits, lens)
-        gold_score = self.score(x, y, lens, logits=logits)
+        gold_score = self.score(xs, y, lens, logits=logits)
         loglik = gold_score - forward_score
 
-        return loglik
+        return loglik, logits
 
 
 def sequence_mask(lens, max_len=None):
