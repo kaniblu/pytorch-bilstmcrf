@@ -16,7 +16,6 @@ from torch.autograd import Variable
 from utils.argparser import ArgParser
 from utils.argparser import path
 from utils.vocab import Vocabulary
-from utils.generator import AutoencodingDataGenerator
 from utils.generator import TextFileReader
 from utils.generator import SentenceGenerator
 from utils.preprocessor import Preprocessor
