@@ -74,7 +74,7 @@ class CRF(nn.Module):
         """
         scores, paths = [], []
 
-        for logit, l in zip(logits, lens):
+        for logit, l in zip(logits, lens.data.tolist()):
             backpointers = []
 
             # Initialize the viterbi variables in log space
