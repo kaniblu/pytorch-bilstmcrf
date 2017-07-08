@@ -21,6 +21,8 @@ from utils.generator import SentenceGenerator
 from utils.preprocessor import Preprocessor
 from utils.visdom import Visdom
 from model import BiLSTMCRF
+from evaluate import compute_f1
+from evaluate import preprocess_labels
 
 
 def parse_args():
@@ -46,9 +48,18 @@ def parse_args():
     group.add("--n_epochs", type=int, default=3)
     group.add("--dropout_prob", type=float, default=0.05)
     group.add("--batch_size", type=int, default=32)
-    group.add("--val_period", type=int, default=100)
-    group.add("--save_period", type=int, default=1000)
     group.add("--max_len", type=int, default=30)
+
+    group = parser.add_group("Save Options")
+    group.add("--save", action="store_true", default=False)
+    group.add("--save_period", type=int, default=1000)
+
+    group = parser.add_group("Validation Options")
+    group.add("--val", action="store_true", default=False)
+    group.add("--val_period", type=int, default=100)
+    group.add("--text_preview", action="store_true", default=False)
+    group.add("--val_feats_path", type=path, action="append")
+    group.add("--val_labels_path", type=path, default=None)
 
     group = parser.add_group("Visdom Options")
     group.add("--visdom_host", type=str, default="localhost")
@@ -153,11 +164,114 @@ def val_sents(feat_vocabs, label_vocab, xs, y, lstm_preds, crf_preds, lens):
     return xs_sents, y_sents, lstm_sents, crf_sents
 
 
-def train(model, data_loader_fn, n_epochs, viz_pool, save_dir, save_period,
-          val_period, n_previews):
+def prepare_val_text(model, batch_xs, batch_y, batch_lens,
+                     logits, preds, n_previews):
+    idx = np.random.permutation(np.arange(batch_lens.size(0)))[:n_previews]
+    idx_v = Variable(torch.LongTensor(idx), volatile=True)
+
+    if model.is_cuda:
+        idx_v = idx_v.cuda()
+
+    logits = torch.index_select(logits, 0, idx_v)
+    bilstm_preds = logits.cpu().max(2)[1].squeeze(-1).data.numpy()
+    crf_preds = preds.cpu().data.numpy()[idx]
+    xs = batch_xs.cpu().data.numpy()[:, idx]
+    y = batch_y.cpu().data.numpy()[idx]
+    lens = batch_lens.cpu().data.numpy()[idx]
+
+    sents = val_sents(model.word_vocabs, model.label_vocab,
+                      xs, y, bilstm_preds, crf_preds, lens)
+    text = val_text(*sents)
+
+    return text
+
+
+def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
+             train_instances):
+    legend = ["Loss", "Precision", "Accuracy", "F1-Score"]
+    title = "Validation"
+    t = tqdm.tqdm()
+
+    nll_all = 0.0
+    prec_all, acc_all, f1_all = 0.0, 0.0, 0.0
+    n_instances = 0
+    loaders = data_loader_fn()
+    for data in zip(*loaders):
+        xs = [x[0] for x in data[:-1]]
+        y, lens = data[-1]
+        batch_size = len(lens)
+
+        batch_xs, batch_y, batch_lens = prepare_batch(xs, y, lens,
+                                                      gpu=model.is_cuda,
+                                                      volatile=True)
+        loglik, logits = model.loglik(batch_xs, batch_y, batch_lens)
+        scores, preds = model.crf.viterbi_decode(logits, batch_lens)
+        negloglik = -loglik.mean()
+        negloglik_v = float(negloglik.data[0])
+
+        if preview_enabled:
+            text = prepare_val_text(model, batch_xs, batch_y, batch_lens,
+                                    logits, preds, n_previews)
+
+            viz_run("code", tuple(), dict(
+                text="Instance {}\n".format(train_instances) + text,
+                opts=dict(
+                    title="Validation Text"
+                )
+            ))
+
+        preds = preds.cpu().data.tolist()
+        y = batch_y.cpu().data.tolist()
+        lens = batch_lens.cpu().data.tolist()
+
+        def _to_taglist(vocab, x):
+            return [[vocab.i2f[w] if w in vocab.i2f else vocab.unk
+                     for w in sent] for sent in x]
+
+        preds = [pred[:l][1:-1] for pred, l in zip(preds, lens)]
+        y = [_y[:l][1:-1] for _y, l in zip(y, lens)]
+        preds = _to_taglist(model.label_vocab, preds)
+        y = _to_taglist(model.label_vocab, y)
+
+        preds = preprocess_labels(preds)
+        y = preprocess_labels(y)
+
+        prec, acc, f1 = compute_f1(preds, y)
+        nll_all += negloglik_v * batch_size
+        prec_all += prec * batch_size
+        acc_all += acc * batch_size
+        f1_all += f1 * batch_size
+
+        t.set_description(
+            "[{}]: validation loss={:.4f}".format(n_instances, negloglik_v))
+        t.update(batch_size)
+        n_instances += batch_size
+
+    nll_all /= n_instances
+    prec_all /= n_instances
+    acc_all /= n_instances
+    f1_all /= n_instances
+
+    plot_X = [train_instances] * 4
+    plot_Y = [nll_all, prec_all, acc_all, f1_all]
+
+    viz_run("plot", tuple(), dict(
+        X=[plot_X],
+        Y=[plot_Y],
+        opts=dict(
+            legend=legend,
+            title=title
+        )
+    ))
+
+
+def train(model, data_loader_fn, val_data_loader_fn, n_epochs, viz_pool,
+          val_period, n_previews, val_enabled, preview_enabled,
+          save_enabled, save_dir, save_period):
     optimizer = O.Adam(model.parameters())
     legend = ["-Log Likelihood"]
     step = 0
+    n_instances = 0
     t = tqdm.tqdm()
 
     for _ in range(n_epochs):
@@ -166,68 +280,46 @@ def train(model, data_loader_fn, n_epochs, viz_pool, save_dir, save_period,
         for data in zip(*loaders):
             xs = [x[0] for x in data[:-1]]
             y, lens = data[-1]
+            batch_size = len(lens)
+            n_instances += batch_size
             step += 1
 
-            is_val = step % val_period == 0
             batch_xs, batch_y, batch_lens = prepare_batch(xs, y, lens,
                                                           gpu=model.is_cuda,
-                                                          volatile=is_val)
+                                                          volatile=False)
             loglik, logits = model.loglik(batch_xs, batch_y, batch_lens)
             negloglik = -loglik.mean()
             negloglik_v = float(negloglik.data[0])
 
-            plot_X = [step]
-            plot_Y = [negloglik_v]
+            plot_X = n_instances
+            plot_Y = negloglik_v
 
-            if not is_val:
-                title = "Training Loss"
-                negloglik.backward()
-                clip_grad_norm(model.parameters(), 3)
-                optimizer.step()
-            else:
-                title = "Validation Loss"
-                idx = np.random.permutation(np.arange(len(lens)))[:n_previews]
-                idx_v = Variable(torch.LongTensor(idx), volatile=True)
+            negloglik.backward()
+            clip_grad_norm(model.parameters(), 3)
+            optimizer.step()
 
-                if model.is_cuda:
-                    idx_v = idx_v.cuda()
-
-                logits = torch.index_select(logits, 0, idx_v)
-                lens = batch_lens.cpu().data.numpy()[idx]
-                bilstm_preds = logits.cpu().max(2)[1].squeeze(-1).data.numpy()
-                scores, preds = model.crf.viterbi_decode(logits, lens)
-                xs = batch_xs.cpu().data.numpy()[:, idx]
-                y = batch_y.cpu().data.numpy()[idx]
-                lens = batch_lens.cpu().data.numpy()[idx]
-
-                sents = val_sents(model.word_vocabs, model.label_vocab,
-                                  xs, y, bilstm_preds, preds, lens)
-                text = val_text(*sents)
-
-                viz_pool.apply_async(viz_run, ("code", tuple(), dict(
-                    text="Step {}\n".format(step) + text,
-                    opts=dict(
-                        title="Validation Text".format(step)
-                    )
-                )))
-
-            viz_pool.apply_async(viz_run, ("plot", tuple(), dict(
+            viz_run("plot", tuple(), dict(
                 X=[plot_X],
                 Y=[plot_Y],
                 opts=dict(
                     legend=legend,
-                    title=title
+                    title="Training Loss"
                 )
-            )))
+            ))
 
-            if step % save_period == 0:
+            if val_enabled and step % val_period == 0:
+                validate(model, val_data_loader_fn, viz_pool, preview_enabled,
+                         n_previews, n_instances)
+
+            if save_enabled and step % save_period == 0:
                 model_filename = "model-{}-({:.4f})".format(step, negloglik_v)
                 path = os.path.join(save_dir, model_filename)
                 torch.save(model.state_dict(), path)
                 viz.save([save_dir])
 
-            t.set_description("[{}]: loss={:.4f}".format(step, negloglik_v))
-            t.update()
+            t.set_description(
+                "[{}]: loss={:.4f}".format(n_instances, negloglik_v))
+            t.update(batch_size)
 
 
 def init_viz(args, kwargs):
@@ -246,6 +338,7 @@ def _load_vocab(path):
     with open(path, "rb") as f:
         return pickle.load(f)
 
+
 def main():
     args = parse_args()
 
@@ -262,7 +355,8 @@ def main():
 
     print("Initializing model...")
     model_cls = BiLSTMCRF
-    model = model_cls(feats_vocabs, labels_vocab, args.word_dim, args.hidden_dim,
+    model = model_cls(feats_vocabs, labels_vocab, args.word_dim,
+                      args.hidden_dim,
                       dropout_prob=args.dropout_prob)
 
     model.reset_parameters()
@@ -270,11 +364,13 @@ def main():
     print("Loading word embeddings...")
 
     for i, (vocab, we_type, we_path, we_freeze) in \
-            enumerate(zip(feats_vocabs, args.wordembed_type, args.wordembed_path, args.wordembed_freeze)):
+            enumerate(
+                zip(feats_vocabs, args.wordembed_type, args.wordembed_path,
+                    args.wordembed_freeze)):
         embeddings = getattr(model, "embeddings_{}".format(i))
 
         if we_type == "glove":
-            load_glove_embeddings(embeddings , vocab, args.wordembed_path)
+            load_glove_embeddings(embeddings, vocab, we_path)
         elif we_type == "fasttext":
             load_fasttext_embeddings(embeddings, vocab,
                                      fasttext_path=args.fasttext_path,
@@ -310,34 +406,52 @@ def main():
     config_path = os.path.join(save_dir, os.path.basename(args.config))
     shutil.copy(args.config, config_path)
 
-    def _data_loader_fn():
-        feats_preps = [Preprocessor(vocab) for vocab in feats_vocabs]
-        labels_prep = Preprocessor(labels_vocab)
-        feats_readers = [TextFileReader(path) for path in args.feats_path]
-        labels_reader = TextFileReader(args.labels_path)
+    def _data_loader_fn_generator(feats_vocabs, labels_vocab, feats_paths,
+                                  labels_path):
+        def _data_loader_fn():
+            feats_preps = [Preprocessor(vocab) for vocab in feats_vocabs]
+            labels_prep = Preprocessor(labels_vocab)
+            feats_readers = [TextFileReader(path) for path in feats_paths]
+            labels_reader = TextFileReader(labels_path)
 
-        feats_gen = [SentenceGenerator(reader, vocab, args.batch_size,
-                                      max_length=args.max_len,
-                                      preprocessor=prep,
-                                      allow_residual=True)
-                     for reader, vocab, prep in
-                     zip(feats_readers, feats_vocabs, feats_preps)]
-        labels_gen = SentenceGenerator(labels_reader, labels_vocab, args.batch_size,
-                                       max_length=args.max_len,
-                                       preprocessor=labels_prep,
-                                       allow_residual=True)
+            feats_gen = [SentenceGenerator(reader, vocab, args.batch_size,
+                                           max_length=args.max_len,
+                                           preprocessor=prep,
+                                           allow_residual=True)
+                         for reader, vocab, prep in
+                         zip(feats_readers, feats_vocabs, feats_preps)]
+            labels_gen = SentenceGenerator(labels_reader, labels_vocab,
+                                           args.batch_size,
+                                           max_length=args.max_len,
+                                           preprocessor=labels_prep,
+                                           allow_residual=True)
 
-        return feats_gen + [labels_gen]
+            return feats_gen + [labels_gen]
+
+        return _data_loader_fn
+
+    _data_loader_fn = _data_loader_fn_generator(feats_vocabs=feats_vocabs,
+                                                labels_vocab=labels_vocab,
+                                                feats_paths=args.feats_path,
+                                                labels_path=args.labels_path)
+    _val_data_loader_fn = _data_loader_fn_generator(feats_vocabs=feats_vocabs,
+                                                    labels_vocab=labels_vocab,
+                                                    feats_paths=args.val_feats_path,
+                                                    labels_path=args.val_labels_path)
 
     print("Beginning training...")
     train(model,
           data_loader_fn=_data_loader_fn,
+          val_data_loader_fn=_val_data_loader_fn,
           n_epochs=args.n_epochs,
           viz_pool=viz_pool,
           save_dir=save_dir,
           n_previews=args.n_previews,
           save_period=args.save_period,
-          val_period=args.val_period)
+          val_enabled=args.val,
+          val_period=args.val_period,
+          preview_enabled=args.text_preview,
+          save_enabled=args.save)
 
     print("Done!")
 

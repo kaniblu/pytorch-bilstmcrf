@@ -24,6 +24,7 @@ def parse_args():
     parser.add("--feats_path", type=path, action="append", required=True)
     parser.add("--feats_vocab", type=path, action="append", required=True)
     parser.add("--labels_vocab", type=path, required=True)
+    parser.add("--sent_tags", action="store_true", default=False)
     parser.add("--save_dir", type=path, required=True)
     parser.add("--batch_size", type=int, default=32)
     parser.add("--max_length", type=int, default=1e10)
@@ -72,10 +73,12 @@ def prepare_batch(xs, lens, gpu=True):
 
     xs = Variable(xs, volatile=True)
     lens = Variable(lens, volatile=True)
+    ridx = Variable(ridx, volatile=True)
 
     if gpu:
         xs = xs.cuda()
         lens = lens.cuda()
+        ridx = ridx.cuda()
 
     return xs, lens, ridx
 
@@ -99,14 +102,20 @@ def predict(model, _data_loader_fn):
         logits = model._forward_bilstm(xs, lens)
         scores, paths = model.crf.viterbi_decode(logits, lens)
 
-        scores_n = [scores[i] for i in ridx]
-        paths_n = [paths[i] for i in ridx]
-        paths_n = [to_sent(model.label_vocab, path) for path in paths_n]
+        scores_n = torch.index_select(scores, 0, ridx)
+        paths_n = torch.index_select(paths, 0, ridx)
+        lens = torch.index_select(lens, 0, ridx)
+
+        lens = lens.cpu().data.tolist()
+        scores_n = scores_n.cpu().data.tolist()
+        paths_n = paths_n.cpu().data.tolist()
+
+        paths_n = [path[:l] for path, l in zip(paths_n, lens)]
 
         all_scores.extend(scores_n)
         all_paths.extend(paths_n)
 
-        t.update(lens.size(0))
+        t.update(len(lens))
 
     return all_scores, all_paths
 
@@ -148,7 +157,7 @@ def main():
     if args.gpu:
         model = model.cuda()
 
-    print("Vectorizing...")
+    print("Predicting...")
 
     def _data_loader_fn():
         feats_preps = [Preprocessor(vocab) for vocab in feats_vocabs]
@@ -163,9 +172,14 @@ def main():
 
         return feats_gen
 
-    scores, paths, = predict(model, _data_loader_fn)
+    scores, paths = predict(model, _data_loader_fn)
 
-    print("Saving vectors...")
+    if not args.sent_tags:
+        paths = [path[1:-1] for path in paths]
+
+    paths = [to_sent(labels_vocab, path) for path in paths]
+
+    print("Saving results...")
     _save(scores, paths, args.save_dir)
 
     print("Done!")

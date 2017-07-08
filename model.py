@@ -35,7 +35,7 @@ class CRF(nn.Module):
         self.transitions = nn.Parameter(torch.randn(n_labels, n_labels))
 
     def reset_parameters(self):
-        I.xavier_normal(self.transitions.data)
+        I.normal(self.transitions.data, 0, 1)
 
     def forward(self, logits, lens):
         """
@@ -61,7 +61,7 @@ class CRF(nn.Module):
 
             mask = (c_lens > 0).float().unsqueeze(-1).expand_as(alpha)
             alpha = mask * alpha_nxt + (1 - mask) * alpha
-            c_lens -= 1
+            c_lens = c_lens - 1
 
         return log_sum_exp(alpha, 1).squeeze(-1)
 
@@ -72,53 +72,41 @@ class CRF(nn.Module):
             logits: [batch_size, seq_len, n_labels] FloatTensor
             lens: [batch_size] LongTensor
         """
-        scores, paths = [], []
+        batch_size, seq_len, n_labels = logits.size()
+        vit = logits.data.new(batch_size, self.n_labels).fill_(-10000)
+        vit[:, self.bos_idx] = 0
+        vit = Variable(vit)
+        c_lens = lens.clone()
 
-        for logit, l in zip(logits, lens.data.tolist()):
-            backpointers = []
+        logits_t = logits.transpose(1, 0)
+        pointers = []
+        for logit in logits_t:
+            vit_exp = vit.unsqueeze(1).expand(batch_size, n_labels, n_labels)
+            trn_exp = self.transitions.unsqueeze(0).expand_as(vit_exp)
+            vit_trn_sum = vit_exp + trn_exp
+            vt_max, vt_argmax = vit_trn_sum.max(2)
 
-            # Initialize the viterbi variables in log space
-            init_vvars = logits.data.new(1, self.n_labels).fill_(-10000.)
-            init_vvars[0][self.bos_idx] = 0
+            vt_max = vt_max.squeeze(-1)
+            vit_nxt = vt_max + logit
+            pointers.append(vt_argmax.squeeze(-1).unsqueeze(0))
 
-            # forward_var at step i holds the viterbi variables for step i-1
-            forward_var = Variable(init_vvars)
-            for feat in logit[:l]:
-                bptrs_t = []  # holds the backpointers for this step
-                viterbivars_t = []  # holds the viterbi variables for this step
+            mask = (c_lens > 0).float().unsqueeze(-1).expand_as(vit_nxt)
+            vit = mask * vit_nxt + (1 - mask) * vit
+            c_lens = c_lens - 1
 
-                for next_tag in range(self.n_labels):
-                    # next_tag_var[i] holds the viterbi variable for tag i at the
-                    # previous step, plus the score of transitioning
-                    # from tag i to next_tag.
-                    # We don't include the emission scores here because the max
-                    # does not depend on them (we add them in below)
-                    next_tag_var = forward_var + self.transitions[next_tag]
-                    best_tag_id = argmax(next_tag_var)
-                    bptrs_t.append(best_tag_id)
-                    viterbivars_t.append(next_tag_var[0][best_tag_id])
-                # Now add in the emission scores, and assign forward_var to the set
-                # of viterbi variables we just computed
-                forward_var = (torch.cat(viterbivars_t) + feat).view(1, -1)
-                backpointers.append(bptrs_t)
+        pointers = torch.cat(pointers)
+        scores, idx = vit.max(1)
+        idx = idx.squeeze(-1)
+        paths = [idx.unsqueeze(1)]
+        for argmax in reversed(pointers):
+            idx_exp = idx.unsqueeze(-1)
+            idx = torch.gather(argmax, 1, idx_exp)
+            idx = idx.squeeze(-1)
 
-            # Transition to STOP_TAG
-            terminal_var = forward_var + self.transitions[self.eos_idx]
-            best_tag_id = argmax(terminal_var)
-            path_score = terminal_var[0][best_tag_id]
+            paths.insert(0, idx.unsqueeze(1))
 
-            # Follow the back pointers to decode the best path.
-            best_path = [best_tag_id]
-            for bptrs_t in reversed(backpointers):
-                best_tag_id = bptrs_t[best_tag_id]
-                best_path.append(best_tag_id)
-            # Pop off the start tag (we dont want to return that to the caller)
-            start = best_path.pop()
-            assert start == self.bos_idx  # Sanity check
-            best_path.reverse()
-
-            paths.append(best_path)
-            scores.append(path_score)
+        paths = torch.cat(paths[1:], 1)
+        scores = scores.squeeze(-1)
 
         return scores, paths
 
