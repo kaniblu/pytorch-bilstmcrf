@@ -225,8 +225,8 @@ def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
             return [[vocab.i2f[w] if w in vocab.i2f else vocab.unk
                      for w in sent] for sent in x]
 
-        preds = [pred[:l][1:-1] for pred, l in zip(preds, lens)]
-        y = [_y[:l][1:-1] for _y, l in zip(y, lens)]
+        preds = [pred[:l] for pred, l in zip(preds, lens)]
+        y = [_y[:l] for _y, l in zip(y, lens)]
         preds = _to_taglist(model.label_vocab, preds)
         y = _to_taglist(model.label_vocab, y)
 
@@ -463,6 +463,9 @@ def main():
           val_period=args.val_period,
           preview_enabled=args.text_preview,
           save_enabled=args.save)
+
+    # Flush remaining buffer
+    viz_run("flush", tuple(), dict())
 
     print("Done!")
 
