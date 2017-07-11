@@ -267,7 +267,8 @@ def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
         opts=dict(
             legend=legend,
             title=title
-        )
+        ),
+        flush=True
     ))
 
 
@@ -319,10 +320,10 @@ def train(model, data_loader_fn, val_data_loader_fn, n_epochs, viz_pool,
             if val_enabled and step % val_period == 0:
                 validate(model, val_data_loader_fn, viz_pool, preview_enabled,
                          n_previews, n_instances)
-                viz_run("flush")
 
             if save_enabled and step % save_period == 0:
-                model_filename = "model-{}-({:.4f})".format(step, negloglik_v)
+                model_filename = "model-{}-{:.4f}".format(
+                    n_instances, abs(negloglik_v))
                 path = os.path.join(save_dir, model_filename)
                 torch.save(model.state_dict(), path)
                 viz.save([save_dir])
