@@ -1,4 +1,5 @@
 import os
+import random
 import pickle
 import shutil
 import tempfile
@@ -42,7 +43,7 @@ def parse_args():
               choices=["glove", "fasttext", "none"])
     group.add("--wordembed_path", type=path, action="append")
     group.add("--fasttext_path", type=path, default=None)
-    group.add("--wordembed_freeze", type=int, action="append")
+    group.add("--wordembed_freeze", type=bool, action="append")
 
     group = parser.add_group("Training Options")
     group.add("--n_epochs", type=int, default=3)
@@ -127,12 +128,12 @@ def prepare_batch(xs, y, lens, gpu=False, volatile=False):
     return xs, y, lens
 
 
-def val_text(xs_sents, y_sents, lstm_sents, crf_sents):
-    text = ""
+def val_texts(xs_sents, y_sents, lstm_sents, crf_sents):
+    texts = []
 
     for j, (xs_sent, y_sent, lstm_sent, crf_sent) in \
             enumerate(zip(xs_sents, y_sents, lstm_sents, crf_sents)):
-        text += "({})\n".format(j + 1)
+        text = ""
 
         for i, x_sent in enumerate(xs_sent):
             text += "Feature_{}: {}\n".format(i, x_sent)
@@ -140,8 +141,9 @@ def val_text(xs_sents, y_sents, lstm_sents, crf_sents):
         text += "Target: {}\n".format(y_sent)
         text += "BiLSTM Output: {}\n".format(lstm_sent)
         text += "CRF Output: {}\n".format(crf_sent)
+        texts.append(text)
 
-    return text
+    return texts
 
 
 def to_sent(vocab, seq):
@@ -164,7 +166,7 @@ def val_sents(feat_vocabs, label_vocab, xs, y, lstm_preds, crf_preds, lens):
     return xs_sents, y_sents, lstm_sents, crf_sents
 
 
-def prepare_val_text(model, batch_xs, batch_y, batch_lens,
+def prepare_val_texts(model, batch_xs, batch_y, batch_lens,
                      logits, preds, n_previews):
     idx = np.random.permutation(np.arange(batch_lens.size(0)))[:n_previews]
     idx_v = Variable(torch.LongTensor(idx), volatile=True)
@@ -181,9 +183,9 @@ def prepare_val_text(model, batch_xs, batch_y, batch_lens,
 
     sents = val_sents(model.word_vocabs, model.label_vocab,
                       xs, y, bilstm_preds, crf_preds, lens)
-    text = val_text(*sents)
+    texts = val_texts(*sents)
 
-    return text
+    return texts
 
 
 def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
@@ -196,6 +198,7 @@ def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
     prec_all, acc_all, f1_all = 0.0, 0.0, 0.0
     n_instances = 0
     loaders = data_loader_fn()
+    texts_all = []
     for data in zip(*loaders):
         xs = [x[0] for x in data[:-1]]
         y, lens = data[-1]
@@ -210,15 +213,9 @@ def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
         negloglik_v = float(negloglik.data[0])
 
         if preview_enabled:
-            text = prepare_val_text(model, batch_xs, batch_y, batch_lens,
+            texts = prepare_val_texts(model, batch_xs, batch_y, batch_lens,
                                     logits, preds, n_previews)
-
-            viz_run("code", tuple(), dict(
-                text="Instance {}\n".format(train_instances) + text,
-                opts=dict(
-                    title="Validation Text"
-                )
-            ))
+            texts_all.extend(texts)
 
         preds = preds.cpu().data.tolist()
         y = batch_y.cpu().data.tolist()
@@ -252,6 +249,15 @@ def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
     acc_all /= n_instances
     f1_all /= n_instances
 
+    if preview_enabled:
+        texts = random.sample(texts_all, n_previews)
+        viz_run("code", tuple(), dict(
+            text="Instance {}\n".format(train_instances) + "\n".join(texts),
+            opts=dict(
+                title="Validation Text"
+            )
+        ))
+
     plot_X = [train_instances] * 4
     plot_Y = [nll_all, prec_all, acc_all, f1_all]
 
@@ -268,7 +274,8 @@ def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
 def train(model, data_loader_fn, val_data_loader_fn, n_epochs, viz_pool,
           val_period, n_previews, val_enabled, preview_enabled,
           save_enabled, save_dir, save_period):
-    optimizer = O.Adam(model.parameters())
+    params = set(p for p in model.parameters() if p.requires_grad)
+    optimizer = O.Adam(params)
     legend = ["-Log Likelihood"]
     step = 0
     n_instances = 0
@@ -278,6 +285,8 @@ def train(model, data_loader_fn, val_data_loader_fn, n_epochs, viz_pool,
         loaders = data_loader_fn()
 
         for data in zip(*loaders):
+            model.zero_grad()
+
             xs = [x[0] for x in data[:-1]]
             y, lens = data[-1]
             batch_size = len(lens)
@@ -409,8 +418,10 @@ def main():
     def _data_loader_fn_generator(feats_vocabs, labels_vocab, feats_paths,
                                   labels_path):
         def _data_loader_fn():
-            feats_preps = [Preprocessor(vocab) for vocab in feats_vocabs]
-            labels_prep = Preprocessor(labels_vocab)
+            feats_preps = [Preprocessor(vocab, add_bos=False, add_eos=False)
+                           for vocab in feats_vocabs]
+            labels_prep = Preprocessor(labels_vocab,
+                                       add_bos=False, add_eos=False)
             feats_readers = [TextFileReader(path) for path in feats_paths]
             labels_reader = TextFileReader(labels_path)
 
@@ -424,7 +435,7 @@ def main():
                                            args.batch_size,
                                            max_length=args.max_len,
                                            preprocessor=labels_prep,
-                                           allow_residual=True)
+                                           allow_residual=True,)
 
             return feats_gen + [labels_gen]
 
