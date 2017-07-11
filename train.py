@@ -319,6 +319,7 @@ def train(model, data_loader_fn, val_data_loader_fn, n_epochs, viz_pool,
             if val_enabled and step % val_period == 0:
                 validate(model, val_data_loader_fn, viz_pool, preview_enabled,
                          n_previews, n_instances)
+                viz_run("flush")
 
             if save_enabled and step % save_period == 0:
                 model_filename = "model-{}-({:.4f})".format(step, negloglik_v)
@@ -337,7 +338,7 @@ def init_viz(args, kwargs):
     viz = Visdom(*args, **kwargs)
 
 
-def viz_run(f_name, args, kwargs):
+def viz_run(f_name, args=(), kwargs=dict()):
     global viz
 
     getattr(viz, f_name).__call__(*args, **kwargs)
