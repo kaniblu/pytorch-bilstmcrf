@@ -39,4 +39,16 @@ Models could handle multiple features
 
 ## Prediction ##
 
-    python predict.py --model_path ...
+Predict tags with given features. Specify model path with `--ckpt_path` option. Model parameters should be identical to those that have been used to train it.
+
+    python predict.py --ckpt_path ... --feats_path sents_test.txt --feats_path pos_test.txt --feats_vocab vocab-sents.pkl ... --save_dir ./output
+    
+Tagged file `preds.txt` and score file `scores.txt` will be written to `--save_dir` directory.
+
+## Evaluation ##
+
+Evaluate predictions with an answer set.
+
+    python evaluate.py --pred_path ./output/preds.txt --gold_path .../tags_test.txt --out_path ./output/res.json
+    
+A simple json file containing the accuracy, precision and f1-score of the test will be written to `--out_path`.
