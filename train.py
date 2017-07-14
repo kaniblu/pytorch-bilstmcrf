@@ -195,10 +195,12 @@ def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
     t = tqdm.tqdm()
 
     nll_all = 0.0
-    prec_all, acc_all, f1_all = 0.0, 0.0, 0.0
     n_instances = 0
     loaders = data_loader_fn()
     texts_all = []
+    preds_all = []
+    y_all = []
+
     for data in zip(*loaders):
         xs = [x[0] for x in data[:-1]]
         y, lens = data[-1]
@@ -233,11 +235,9 @@ def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
         preds = preprocess_labels(preds)
         y = preprocess_labels(y)
 
-        prec, acc, f1 = compute_f1(preds, y)
+        preds_all.extend(preds)
+        y_all.extend(y)
         nll_all += negloglik_v * batch_size
-        prec_all += prec * batch_size
-        acc_all += acc * batch_size
-        f1_all += f1 * batch_size
 
         t.set_description(
             "[{}]: validation loss={:.4f}".format(n_instances, negloglik_v))
@@ -245,9 +245,7 @@ def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
         n_instances += batch_size
 
     nll_all /= n_instances
-    prec_all /= n_instances
-    acc_all /= n_instances
-    f1_all /= n_instances
+    prec, rec, f1 = compute_f1(preds_all, y_all)
 
     if preview_enabled:
         texts = random.sample(texts_all, n_previews)
@@ -259,7 +257,7 @@ def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
         ))
 
     plot_X = [train_instances] * 4
-    plot_Y = [nll_all, prec_all, acc_all, f1_all]
+    plot_Y = [nll_all, prec, rec, f1]
 
     viz_run("plot", tuple(), dict(
         X=[plot_X],
