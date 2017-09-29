@@ -19,7 +19,7 @@ Run visdom server beforehand.
 
 Create vocabulary per feature (e.g.):
 
-    python -m utils.vocab --input_dir sents.txt --vocab_path vocab-sents.pkl --cutoff 30000
+    python -m utils.vocab --data_dir sents.txt --vocab_path vocab-sents.pkl --cutoff 30000
 
 Use the vocabulary file for new training instances:
 
