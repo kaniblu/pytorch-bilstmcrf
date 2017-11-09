@@ -17,6 +17,18 @@ Run visdom server beforehand.
 
 ## Training ##
 
+Prepare feature files. For example, for NER task, sentence forms and part-of-speech tags are used as inputs:
+
+    (sents.txt)
+    the fat rat sat on a mat
+    the cat sat on a mat
+    ...
+    
+    (pos.txt)
+    det adj noun verb prep det noun
+    det noun verb prep det noun
+    ...
+    
 Create vocabulary per feature (e.g.):
 
     python -m utils.vocab --data_dir sents.txt --vocab_path vocab-sents.pkl --cutoff 30000
