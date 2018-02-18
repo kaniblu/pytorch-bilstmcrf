@@ -1,11 +1,3 @@
-import os
-import json
-
-from utils.argparser import ArgParser
-from utils.argparser import path
-from utils import ensure_dir_exists
-
-
 def normalize_pretag(pretag):
     if pretag == "S":
         return "B"
@@ -87,45 +79,3 @@ def compute_precision(guessed, correct):
         precision = float(correctCount) / count
 
     return precision
-
-
-def parse_args():
-    parser = ArgParser(allow_config=True)
-    parser.add("--pred_path", type=path, required=True)
-    parser.add("--gold_path", type=path, required=True)
-    parser.add("--out_path", type=path, required=True)
-
-    args = parser.parse_args()
-
-    return args
-
-
-def main():
-    args = parse_args()
-
-    ensure_dir_exists(args.out_path)
-
-    print("Loading files...")
-    preds = load_file(args.pred_path)
-    golds = load_file(args.gold_path)
-    preds = preprocess_labels(preds)
-    golds = preprocess_labels(golds)
-
-    print("Computing scores...")
-    prec, rec, f1 = compute_f1(preds, golds)
-
-    data = {
-        "prec": prec,
-        "rec": rec,
-        "f1": f1
-    }
-
-    print("Saving...")
-    with open(args.out_path, "w") as f:
-        f.write(json.dumps(data))
-
-    print("Done!")
-
-
-if __name__ == '__main__':
-    main()

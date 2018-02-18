@@ -2,28 +2,21 @@ import torch
 import torch.nn as nn
 import torch.nn.init as I
 import torch.nn.utils.rnn as R
-import torch.nn.functional as F
 from torch.autograd import Variable
-
-
-def selu(x):
-    alpha = 1.6732632423543772848170429916717
-    scale = 1.0507009873554804934193349852946
-    return scale * F.elu(x, alpha)
 
 
 def log_sum_exp(vec, dim=0):
     max, idx = torch.max(vec, dim)
-    max_exp = max.expand_as(vec)
+    max_exp = max.unsqueeze(-1).expand_as(vec)
     return max + torch.log(torch.sum(torch.exp(vec - max_exp), dim))
 
 
 class CRF(nn.Module):
-    def __init__(self, vocab):
+    def __init__(self, vocab_size):
         super(CRF, self).__init__()
 
-        self.vocab = vocab
-        self.n_labels = n_labels = len(vocab) + 2
+        self.vocab_size = vocab_size
+        self.n_labels = n_labels = vocab_size + 2
         self.start_idx = n_labels - 2
         self.stop_idx = n_labels - 1
         self.transitions = nn.Parameter(torch.randn(n_labels, n_labels))
@@ -152,52 +145,44 @@ class CRF(nn.Module):
         return score
 
 
-class BiLSTMCRF(nn.Module):
-    def __init__(self, word_vocabs, label_vocab, word_dims, hidden_dim,
-                 dropout_prob):
-        super(BiLSTMCRF, self).__init__()
+class LSTMCRF(nn.Module):
+    def __init__(self, crf, vocab_sizes, word_dims, hidden_dim, layers,
+                 dropout_prob, bidirectional=False):
+        super(LSTMCRF, self).__init__()
 
-        assert len(word_vocabs) == len(word_dims)
-
-        self.n_feats = len(word_vocabs)
-        self.word_dim = sum(word_dims)
-        self.word_vocabs = word_vocabs
-        self.label_vocab = label_vocab
+        self.n_feats = len(word_dims)
+        self.total_word_dim = sum(word_dims)
         self.word_dims = word_dims
         self.hidden_dim = hidden_dim
+        self.lstm_layers = layers
         self.dropout_prob = dropout_prob
         self.is_cuda = False
 
-        self.crf = CRF(label_vocab)
+        self.crf = crf
+        self.bidirectional = bidirectional
         self.n_labels = n_labels = self.crf.n_labels
+        self.embeddings = nn.ModuleList(
+            [nn.Embedding(vocab_size, word_dim)
+             for vocab_size, word_dim in zip(vocab_sizes, word_dims)]
+        )
 
-        for i, (word_vocab, word_dim) in enumerate(zip(word_vocabs, word_dims)):
-            setattr(self, "embeddings_{}".format(i),
-                    nn.Embedding(len(word_vocab), word_dim))
+        self.output_hidden_dim = self.hidden_dim
+        if bidirectional:
+            self.output_hidden_dim *= 2
 
-        self.input_layer = nn.Linear(self.word_dim, hidden_dim)
-        self.output_layer = nn.Linear(hidden_dim * 2, n_labels)
+        self.tanh = nn.Tanh()
+        self.input_layer = nn.Linear(self.total_word_dim, hidden_dim)
+        self.output_layer = nn.Linear(self.output_hidden_dim, n_labels)
         self.lstm = nn.LSTM(input_size=hidden_dim,
                             hidden_size=hidden_dim,
-                            num_layers=1,
-                            bidirectional=True,
+                            num_layers=layers,
+                            bidirectional=bidirectional,
                             dropout=dropout_prob,
                             batch_first=True)
 
-    def cuda(self, *args, **kwargs):
-        ret = super(BiLSTMCRF, self).cuda(*args, **kwargs)
-        self.is_cuda = True
-        return ret
-
-    def cpu(self, *args, **kwargs):
-        ret = super(BiLSTMCRF, self).cpu(*args, **kwargs)
-        self.is_cuda = False
-        return ret
-
     def reset_parameters(self):
-        for i in range(self.n_feats):
-            embeddings = getattr(self, "embeddings_{}".format(i))
-            I.xavier_normal(embeddings.weight.data)
+        for emb in self.embeddings:
+            I.xavier_normal(emb.weight.data)
 
         I.xavier_normal(self.input_layer.weight.data)
         I.xavier_normal(self.output_layer.weight.data)
@@ -230,13 +215,7 @@ class BiLSTMCRF(nn.Module):
 
         assert n_feats == self.n_feats
 
-        res = []
-        for i, x in enumerate(xs):
-            embeddings = getattr(self, "embeddings_{}".format(i))
-
-            x = embeddings(x)
-            res.append(x)
-
+        res = [emb(x) for emb, x in zip(self.embeddings, xs)]
         x = torch.cat(res, 2)
 
         return x
@@ -245,15 +224,15 @@ class BiLSTMCRF(nn.Module):
         n_feats, batch_size, seq_len = xs.size()
 
         x = self._embeddings(xs)
-        x = x.view(-1, self.word_dim)
-        x = selu(self.input_layer(x))
+        x = x.view(-1, self.total_word_dim)
+        x = self.tanh(self.input_layer(x))
         x = x.view(batch_size, seq_len, self.hidden_dim)
 
         o, h = self._run_rnn_packed(self.lstm, x, lens)
 
         o = o.contiguous()
-        o = o.view(-1, self.hidden_dim * 2)
-        o = selu(self.output_layer(o))
+        o = o.view(-1, self.output_hidden_dim)
+        o = self.tanh(self.output_layer(o))
         o = o.view(batch_size, seq_len, self.n_labels)
 
         return o
@@ -278,13 +257,40 @@ class BiLSTMCRF(nn.Module):
 
         return score
 
-    def loglik(self, xs, y, lens):
+    def predict(self, xs, lens, return_scores=False):
+        logits = self._forward_bilstm(xs, lens)
+        scores, preds = self.crf.viterbi_decode(logits, lens)
+
+        if return_scores:
+            return preds, scores
+        else:
+            return preds
+
+    def loglik(self, xs, y, lens, return_logits=False):
         logits = self._forward_bilstm(xs, lens)
         norm_score = self.crf(logits, lens)
         sequence_score = self.score(xs, y, lens, logits=logits)
         loglik = sequence_score - norm_score
 
-        return loglik, logits
+        if return_logits:
+            return loglik, logits
+        else:
+            return loglik
+
+
+class TransparentDataParallel(nn.DataParallel):
+    def __init__(self, *args, **kwargs):
+        super(TransparentDataParallel, self).__init__(*args, **kwargs)
+
+    def __getattr__(self, item):
+        try:
+            return super(TransparentDataParallel, self).__getattr__(item)
+        except AttributeError:
+            module = self.__dict__["_modules"]["module"]
+            return module.__getattribute__(item)
+
+    def state_dict(self, *args, **kwargs):
+        return self.module.state_dict(*args, **kwargs)
 
 
 def sequence_mask(lens, max_len=None):

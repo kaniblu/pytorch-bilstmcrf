@@ -1,23 +1,20 @@
 # BiLSTM-CRF on PyTorch #
 
-An efficient BiLSTM-CRF implementation that can leverage batch operations on
-GPUs.
+An efficient BiLSTM-CRF implementation that leverages mini-batch operations on multiple GPUs.
 
-This repository must be cloned *recursively* due to submodules.
+Tested on the latest PyTorch Version (0.3.0) and Python 3.5+.
 
-    git clone https://github.com/kaniblu/pytorch-bilstmcrf --recursive
+## Requirements ##
 
-Install all required packages (other than pytorch) from utils/requirements.txt
+Install all required packages (other than pytorch) from `requirements.txt`
 
     pip install -r requirements.txt
 
-Run visdom server beforehand.
-
-    python -m visdom.server
+Optionally, standalone tensorboard can be installed from `https://github.com/dmlc/tensorboard` for visualization and plotting capabilities.
 
 ## Training ##
 
-Prepare feature files. For example, for NER task, sentence forms and part-of-speech tags are used as inputs:
+Prepare data first. Data must be supplied with separate text files for each input or target label type. Each line contains a single sequence, and each pair of tokens are separated with a space. For example, for the task of Named Entity Recognition using words and Part-of-Speech tags, the input and label files might be prepared as follows:
 
     (sents.txt)
     the fat rat sat on a mat
@@ -29,38 +26,27 @@ Prepare feature files. For example, for NER task, sentence forms and part-of-spe
     det noun verb prep det noun
     ...
     
-Create vocabulary per feature (e.g.):
+    (labels.txt)
+    O O B-Animal O O O B-Object
+    O B-Animal O O O O B-Object
+    ...
+    
+Then above input and label files are provided to `train.py` using `--input-path` and `--label-path` respectively.
 
-    python -m utils.vocab --data_dir sents.txt --vocab_path vocab-sents.pkl --cutoff 30000
+    python train.py --input-path sents.txt --input-path pos.txt --label-path labels.txt ...
 
-Use the vocabulary file for new training instances:
+You might need to setup several more parameters in order to make it work. Checkout `examples/atis` for an example of training a simple BiLSTM-CRF model with ATIS dataset. Run `python preprocess.py` at the example directory to convert to the dataset to`train.py`-friendly format, then run 
 
-    python train.py --feats_path sents.txt --feats_vocab vocab-sents.pkl ...
-
-More options are available through argparse help.
-
-    python train.py --help
-
-All options could be saved to a separate config file (either in json or yaml).
-
-    python train.py --config train.yml
-
-Models could handle multiple features
-
-    python train.py --feats_path sents.txt --feats_path pos.txt --feats_vocab vocab-sents.pkl --feats_vocab vocab-pos.pkl ...
+    python ../../train.py --config train-atis.yml`
+ 
+ to see a running example. The example configuration assumes that standalone tensorboard is installed (you could turn it off in the configuration file).
+ 
+ For more information on the configurations, check out `python train.py --help`.
 
 ## Prediction ##
 
-Predict tags with given features. Specify model path with `--ckpt_path` option. Model parameters should be identical to those that have been used to train it.
-
-    python predict.py --ckpt_path ... --feats_path sents_test.txt --feats_path pos_test.txt --feats_vocab vocab-sents.pkl ... --save_dir ./output
-    
-Tagged file `preds.txt` and score file `scores.txt` will be written to `--save_dir` directory.
+`TODO`
 
 ## Evaluation ##
 
-Evaluate predictions with an answer set.
-
-    python evaluate.py --pred_path ./output/preds.txt --gold_path .../tags_test.txt --out_path ./output/res.json
-    
-A simple json file containing the accuracy, precision and f1-score of the test will be written to `--out_path`.
+`TODO`

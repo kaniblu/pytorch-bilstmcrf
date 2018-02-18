@@ -1,0 +1,17 @@
+input-path: [data/train/words.txt, data/train/nes.txt]
+label-path: data/train/labels.txt
+save-dir: bilstmcrf-results
+gpu: [0]
+tensorboard: false
+epochs: 100
+dropout-prob: 0.05
+batch-size: 256
+ckpt-period: 10e
+val: true
+val-ratio: 0.1
+val-period: 1e
+samples: 10
+word-dim: [300, 300]
+lstm-dim: 600
+lstm-layers: 1
+bidirectional: true

@@ -1,79 +1,114 @@
 import os
-import random
 import pickle
 import shutil
+import logging
+import argparse
 import tempfile
-import datetime
 import subprocess
-import multiprocessing.pool as mp
+import collections
 
 import numpy as np
+import yaap
 import tqdm
 import torch
+import torch.nn as nn
 import torch.optim as O
-from torch.nn.utils import clip_grad_norm
-from torch.autograd import Variable
+import torch.autograd as A
 
-from utils.argparser import ArgParser
-from utils.argparser import path
-from utils.vocab import Vocabulary
-from utils.generator import TextFileReader
-from utils.generator import SentenceGenerator
-from utils.preprocessor import Preprocessor
-from utils.visdom import Visdom
-from model import BiLSTMCRF
-from evaluate import compute_f1
-from evaluate import preprocess_labels
+import utils
+import data as D
+import model as M
+import evaluate as E
 
 
-def parse_args():
-    parser = ArgParser(allow_config=True)
+parser = yaap.ArgParser(
+    allow_config=True,
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter
+)
 
-    parser.add("--name", type=str, default="main")
-    parser.add("--feats_path", type=path, action="append", required=True)
-    parser.add("--feats_vocab", type=path, action="append", required=True)
-    parser.add("--labels_path", type=path, required=True)
-    parser.add("--labels_vocab", type=path, required=True)
-    parser.add("--save_dir", type=path, required=True)
-    parser.add("--gpu", action="store_true", default=False)
-    parser.add("--n_previews", type=int, default=10)
+group = parser.add_group("Basic Options")
+group.add("--input-path", type=yaap.path, action="append", required=True,
+          help="Path to input file that contains sequences of tokens "
+               "separated by spaces.")
+group.add("--label-path", type=yaap.path, required=True,
+          help="Path to label file that contains sequences of token "
+               "labels separated by spaces. Note that the number of "
+               "tokens in each sequence must be equal to that of the "
+               "corresponding input sequence.")
+group.add("--save-dir", type=yaap.path, required=True,
+          help="Directory to save outputs (checkpoints, vocabs, etc.)")
+group.add("--gpu", type=int, action="append",
+          help="Device id of gpu to use. Could supply multiple gpu ids "
+               "to denote multi-gpu utilization. If no gpus are "
+               "specified, cpu is used as default.")
+group.add("--tensorboard", action="store_true", default=False,
+          help="Whether to enable tensorboard visualization. Requires "
+               "standalone tensorboard, which can be installed via "
+               "'https://github.com/dmlc/tensorboard'.")
 
-    group = parser.add_group("Word Embedding Options")
-    group.add("--wordembed_type", type=str, action="append",
-              choices=["glove", "fasttext", "none"])
-    group.add("--wordembed_path", type=path, action="append")
-    group.add("--fasttext_path", type=path, default=None)
-    group.add("--wordembed_freeze", type=bool, action="append")
+group = parser.add_group("Word Embedding Options")
+group.add("--wordembed-type", type=str, action="append",
+          choices=["glove", "fasttext", "none"],
+          help="Type of pretrained word embeddings to use for each input. "
+               "If multiple input paths are supplied, the same number of "
+               "this option must be specified as well. If no option is "
+               "supplied, no word embeddings will be used.")
+group.add("--wordembed-path", type=yaap.path, action="append",
+          help="Path to pre-trained word embeddings. "
+               "If embedding type is 'glove', glove-style embedding "
+               "file is expected. If embedding type is 'fasttext', "
+               "fasttext model file is expected. The number of "
+               "specifications must match the number of inputs.")
+group.add("--fasttext_path", type=yaap.path, default=None,
+          help="If embedding type is 'fasttext', path to fasttext "
+               "binaries must be specified. Otherwise, this option is "
+               "ignored.")
+group.add("--wordembed-freeze", type=bool, action="append",
+          help="Whether to freeze embeddings matrix during training. "
+               "The number of specifications must match the number of "
+               "inputs. If none is specified, word embeddings will not be "
+               "frozen by default.")
 
-    group = parser.add_group("Training Options")
-    group.add("--n_epochs", type=int, default=3)
-    group.add("--dropout_prob", type=float, default=0.05)
-    group.add("--batch_size", type=int, default=32)
-    group.add("--max_len", type=int, default=30)
+group = parser.add_group("Training Options")
+group.add("--epochs", type=int, default=3,
+          help="Number of training epochs.")
+group.add("--dropout-prob", type=float, default=0.05,
+          help="Probability in dropout layers.")
+group.add("--batch-size", type=int, default=32,
+          help="Mini-batch size.")
+group.add("--shuffle", action="store_true", default=False,
+          help="Whether to shuffle the dataset.")
+# group.add("--max-len", type=int, default=30,
+#           help="Maximum length of sequences. If a training example "
+#                "is longer than this option, it will be skipped.")
+group.add("--ckpt-period", type=utils.PeriodChecker, default="1e",
+          help="Period to wait until a model checkpoint is "
+               "saved to the disk. "
+               "Periods are specified by an integer and a unit ('e': "
+               "epoch, 'i': iteration, 's': global step).")
 
-    group = parser.add_group("Save Options")
-    group.add("--save", action="store_true", default=False)
-    group.add("--save_period", type=int, default=1000)
+group = parser.add_group("Validation Options")
+group.add("--val", action="store_true", default=False,
+          help="Whether to perform validation.")
+group.add("--val-ratio", type=float, default=0.1)
+group.add("--val-period", type=utils.PeriodChecker, default="100i",
+          help="Period to wait until a validation is performed. "
+               "Periods are specified by an integer and a unit ('e': "
+               "epoch, 'i': iteration, 's': global step).")
+group.add("--samples", type=int, default=10,
+          help="Number of output samples to display at each iteration.")
 
-    group = parser.add_group("Validation Options")
-    group.add("--val", action="store_true", default=False)
-    group.add("--val_period", type=int, default=100)
-    group.add("--text_preview", action="store_true", default=False)
-    group.add("--val_feats_path", type=path, action="append")
-    group.add("--val_labels_path", type=path, default=None)
-
-    group = parser.add_group("Visdom Options")
-    group.add("--visdom_host", type=str, default="localhost")
-    group.add("--visdom_port", type=int, default=8097)
-    group.add("--visdom_buffer_size", type=int, default=10)
-
-    group = parser.add_group("Model Parameters")
-    group.add("--word_dim", type=int, action="append")
-    group.add("--hidden_dim", type=int, required=True)
-
-    args = parser.parse_args()
-
-    return args
+group = parser.add_group("Model Parameters")
+group.add("--word-dim", type=int, action="append",
+          help="Dimensions of word embeddings. Must be specified for each "
+               "input. Defaults to 300 if none is specified.")
+group.add("--lstm-dim", type=int, default=300,
+          help="Dimensions of lstm cells. This determines the hidden "
+               "state and cell state sizes.")
+group.add("--lstm-layers", type=int, default=1,
+          help="Layers of lstm cells.")
+group.add("--bidirectional", action="store_true", default=False,
+          help="Whether lstm cells are bidirectional.")
 
 
 def load_glove_embeddings(embeddings, vocab, path):
@@ -111,364 +146,426 @@ def load_fasttext_embeddings(embeddings, vocab, fasttext_path, embedding_path):
     load_glove_embeddings(embeddings, vocab, out_path)
 
 
-def prepare_batch(xs, y, lens, gpu=False, volatile=False):
-    lens, idx = torch.sort(lens, 0, True)
-    xs, y = [x[idx] for x in xs], y[idx]
-    xs = torch.cat([x.unsqueeze(0) for x in xs])
+class BaseLSTMCRFTrainer(object):
+    def __init__(self, model: M.LSTMCRF, epochs=5, optimizer=O.Adam, gpus=None):
+        self.model = model
+        self.epochs = epochs
+        self.optimizer_cls = optimizer
+        self.optimizer = optimizer(self.model.parameters())
+        self.gpus = gpus
+        self.gpu_main = None
 
-    xs = Variable(xs, volatile=volatile)
-    y = Variable(y, volatile=volatile)
-    lens = Variable(lens, volatile=volatile)
-
-    if gpu:
-        xs = xs.cuda(async=True)
-        y = y.cuda(async=True)
-        lens = lens.cuda(async=True)
-
-    return xs, y, lens
-
-
-def val_texts(xs_sents, y_sents, lstm_sents, crf_sents):
-    texts = []
-
-    for j, (xs_sent, y_sent, lstm_sent, crf_sent) in \
-            enumerate(zip(xs_sents, y_sents, lstm_sents, crf_sents)):
-        text = ""
-
-        for i, x_sent in enumerate(xs_sent):
-            text += "Feature_{}: {}\n".format(i, x_sent)
-
-        text += "Target: {}\n".format(y_sent)
-        text += "BiLSTM Output: {}\n".format(lstm_sent)
-        text += "CRF Output: {}\n".format(crf_sent)
-        texts.append(text)
-
-    return texts
-
-
-def to_sent(vocab, seq):
-    return " ".join(vocab.i2f[x] if x in vocab.i2f else vocab.unk
-                    for x in seq)
-
-
-def val_sents(feat_vocabs, label_vocab, xs, y, lstm_preds, crf_preds, lens):
-    xs = np.transpose(xs, (1, 0, 2))
-    xs_sents = [[to_sent(feat_vocab, x_[:l])
-                 for feat_vocab, x_ in zip(feat_vocabs, x)]
-                for x, l in zip(xs, lens)]
-    y_sents = [to_sent(label_vocab, y_[:l])
-               for y_, l in zip(y, lens)]
-    lstm_sents = [to_sent(label_vocab, x[:l])
-                  for x, l in zip(lstm_preds, lens)]
-    crf_sents = [to_sent(label_vocab, x[:l])
-                 for x, l in zip(crf_preds, lens)]
-
-    return xs_sents, y_sents, lstm_sents, crf_sents
-
-
-def prepare_val_texts(model, batch_xs, batch_y, batch_lens,
-                     logits, preds, n_previews):
-    idx = np.random.permutation(np.arange(batch_lens.size(0)))[:n_previews]
-    idx_v = Variable(torch.LongTensor(idx), volatile=True)
-
-    if model.is_cuda:
-        idx_v = idx_v.cuda()
-
-    logits = torch.index_select(logits, 0, idx_v)
-    bilstm_preds = logits.cpu().max(2)[1].squeeze(-1).data.numpy()
-    crf_preds = preds.cpu().data.numpy()[idx]
-    xs = batch_xs.cpu().data.numpy()[:, idx]
-    y = batch_y.cpu().data.numpy()[idx]
-    lens = batch_lens.cpu().data.numpy()[idx]
-
-    sents = val_sents(model.word_vocabs, model.label_vocab,
-                      xs, y, bilstm_preds, crf_preds, lens)
-    texts = val_texts(*sents)
-
-    return texts
-
-
-def validate(model, data_loader_fn, viz_pool, preview_enabled, n_previews,
-             train_instances):
-    legend = ["Loss", "Precision", "Accuracy", "F1-Score"]
-    title = "Validation"
-    t = tqdm.tqdm()
-
-    nll_all = 0.0
-    n_instances = 0
-    loaders = data_loader_fn()
-    texts_all = []
-    preds_all = []
-    y_all = []
-
-    for data in zip(*loaders):
-        xs = [x[0] for x in data[:-1]]
-        y, lens = data[-1]
-        batch_size = len(lens)
-
-        batch_xs, batch_y, batch_lens = prepare_batch(xs, y, lens,
-                                                      gpu=model.is_cuda,
-                                                      volatile=True)
-        loglik, logits = model.loglik(batch_xs, batch_y, batch_lens)
-        scores, preds = model.crf.viterbi_decode(logits, batch_lens)
-        negloglik = -loglik.mean()
-        negloglik_v = float(negloglik.data[0])
-
-        if preview_enabled:
-            texts = prepare_val_texts(model, batch_xs, batch_y, batch_lens,
-                                    logits, preds, n_previews)
-            texts_all.extend(texts)
-
-        preds = preds.cpu().data.tolist()
-        y = batch_y.cpu().data.tolist()
-        lens = batch_lens.cpu().data.tolist()
-
-        def _to_taglist(vocab, x):
-            return [[vocab.i2f[w] if w in vocab.i2f else vocab.unk
-                     for w in sent] for sent in x]
-
-        preds = [pred[:l] for pred, l in zip(preds, lens)]
-        y = [_y[:l] for _y, l in zip(y, lens)]
-        preds = _to_taglist(model.label_vocab, preds)
-        y = _to_taglist(model.label_vocab, y)
-
-        preds = preprocess_labels(preds)
-        y = preprocess_labels(y)
-
-        preds_all.extend(preds)
-        y_all.extend(y)
-        nll_all += negloglik_v * batch_size
-
-        t.set_description(
-            "[{}]: validation loss={:.4f}".format(n_instances, negloglik_v))
-        t.update(batch_size)
-        n_instances += batch_size
-
-    nll_all /= n_instances
-    prec, rec, f1 = compute_f1(preds_all, y_all)
-
-    if preview_enabled:
-        texts = random.sample(texts_all, n_previews)
-        viz_run("code", tuple(), dict(
-            text="Instance {}\n".format(train_instances) + "\n".join(texts),
-            opts=dict(
-                title="Validation Text"
+        if gpus is not None:
+            self.gpus = self._ensure_tuple(self.gpus)
+            self.gpu_main = self.gpus[0]
+            self.model = M.TransparentDataParallel(
+                self.model,
+                device_ids=self.gpus,
+                output_device=self.gpu_main
             )
-        ))
 
-    plot_X = [train_instances] * 4
-    plot_Y = [nll_all, prec, rec, f1]
+    def wrap_var(self, x, **kwargs):
+        x = A.Variable(x, **kwargs)
 
-    viz_run("plot", tuple(), dict(
-        X=[plot_X],
-        Y=[plot_Y],
-        opts=dict(
-            legend=legend,
-            title=title
-        ),
-        flush=True
-    ))
+        if self.gpus is not None:
+            x = x.cuda(self.gpu_main)
 
+        return x
 
-def train(model, data_loader_fn, val_data_loader_fn, n_epochs, viz_pool,
-          val_period, n_previews, val_enabled, preview_enabled,
-          save_enabled, save_dir, save_period):
-    params = set(p for p in model.parameters() if p.requires_grad)
-    optimizer = O.Adam(params)
-    legend = ["-Log Likelihood"]
-    step = 0
-    n_instances = 0
-    t = tqdm.tqdm()
+    @staticmethod
+    def _ensure_tuple(x):
+        if not isinstance(x, collections.Sequence):
+            return (x, )
 
-    for _ in range(n_epochs):
-        loaders = data_loader_fn()
+        return x
 
-        for data in zip(*loaders):
-            model.zero_grad()
+    def prepare_batch(self, xs, y, lens, **var_kwargs):
+        lens, idx = torch.sort(lens, 0, True)
+        xs, y = xs[:, idx], y[idx]
+        xs, y = self.wrap_var(xs, **var_kwargs), self.wrap_var(y, **var_kwargs)
+        lens = self.wrap_var(lens, **var_kwargs)
 
-            xs = [x[0] for x in data[:-1]]
-            y, lens = data[-1]
-            batch_size = len(lens)
-            n_instances += batch_size
-            step += 1
+        return xs, y, lens
 
-            batch_xs, batch_y, batch_lens = prepare_batch(xs, y, lens,
-                                                          gpu=model.is_cuda,
-                                                          volatile=False)
-            loglik, logits = model.loglik(batch_xs, batch_y, batch_lens)
-            negloglik = -loglik.mean()
-            negloglik_v = float(negloglik.data[0])
+    def on_iter_complete(self, loss, local_iter, global_iter, global_step):
+        pass
 
-            plot_X = n_instances
-            plot_Y = negloglik_v
+    def on_epoch_complete(self, epoch_idx, global_iter, global_step):
+        pass
 
-            negloglik.backward()
-            clip_grad_norm(model.parameters(), 3)
-            optimizer.step()
+    def train(self, data, data_size=None):
+        if data_size is not None:
+            total_steps = self.epochs * data_size
+        else:
+            total_steps = None
 
-            viz_run("plot", tuple(), dict(
-                X=[plot_X],
-                Y=[plot_Y],
-                opts=dict(
-                    legend=legend,
-                    title="Training Loss"
-                )
-            ))
+        self.model.train(True)
+        global_step = 0
+        global_iter = 0
+        progress = tqdm.tqdm(total=total_steps)
 
-            if val_enabled and step % val_period == 0:
-                validate(model, val_data_loader_fn, viz_pool, preview_enabled,
-                         n_previews, n_instances)
+        for e_idx in range(self.epochs):
+            e_idx += 1
+            for i_idx, (batch, lens) in enumerate(data):
+                batch_size = batch[0].size(0)
+                i_idx += 1
+                global_step += batch_size
+                global_iter += 1
+                self.model.zero_grad()
 
-            if save_enabled and step % save_period == 0:
-                model_filename = "model-{}-{:.4f}".format(
-                    n_instances, abs(negloglik_v))
-                path = os.path.join(save_dir, model_filename)
-                torch.save(model.state_dict(), path)
-                viz.save([save_dir])
+                xs, y = batch[:-1], batch[-1]
+                xs_var, y_var, lens_s = self.prepare_batch(xs, y, lens)
 
-            t.set_description(
-                "[{}]: loss={:.4f}".format(n_instances, negloglik_v))
-            t.update(batch_size)
+                loglik = self.model.loglik(xs_var, y_var, lens_s)
+                nll = -loglik.mean()
+                nll_v = float(-(loglik / lens_s.float()).data[0])
+                nll.backward()
+                self.optimizer.step()
+
+                progress.update(batch_size)
+                progress.set_description(f"nll={nll_v:.4f}")
+                self.on_iter_complete(nll_v, i_idx, global_iter, global_step)
+            self.on_epoch_complete(e_idx, global_iter, global_step)
 
 
-def init_viz(args, kwargs):
-    global viz
+class LSTMCRFTrainer(BaseLSTMCRFTrainer):
+    def __init__(self, sargs, input_vocabs, label_vocab, *args,
+                 val_data=None, **kwargs):
+        super(LSTMCRFTrainer, self).__init__(*args, **kwargs)
 
-    viz = Visdom(*args, **kwargs)
+        self.args = sargs
+        self.input_vocabs = input_vocabs
+        self.label_vocab = label_vocab
+        self.val_data = val_data
+        self.writer = None
+
+        if self.args.tensorboard:
+            self.writer = T.SummaryWriter(self.args.save_dir)
+
+        self.repeatables = {
+            self.args.ckpt_period: self.save_checkpoint
+        }
+
+        if self.args.val:
+            self.repeatables[self.args.val_period] = \
+                self.validate
+
+    @staticmethod
+    def get_longest_word(vocab):
+        lens = [(len(w), w) for w in vocab.f2i]
+        return max(lens, key=lambda x: x[0])[1]
+
+    def display_row(self, items, widths):
+        assert len(items) == len(widths)
+
+        padded = ["{{:>{}s}}".format(w).format(item)
+                  for item, w in zip(items, widths)]
+        logging.info(" ".join(padded))
+
+    def display_samples(self, inputs, targets, lstms, crfs):
+        assert len(self.input_vocabs) == len(inputs), \
+            "Number of input features do not match."
+
+        inputs = [[self.lexicalize(s, v) for s in input]
+                  for input, v in zip(inputs, self.input_vocabs)]
+        targets = [self.lexicalize(s, self.label_vocab) for s in targets]
+        lstms = [self.lexicalize(s, self.label_vocab) for s in lstms]
+        crfs = [self.lexicalize(s, self.label_vocab) for s in crfs]
+        transposed = list(zip(*(inputs + [lstms, crfs, targets])))
+        col_names = [f"INPUT{i + 1:02d}" for i in range(len(inputs))] + \
+            ["LSTM", "CRF", "TARGETS"]
+        vocabs = self.input_vocabs + [self.label_vocab] * 3
+        col_widths = [max(len(self.get_longest_word(v)), len(c))
+                      for v, c in zip(vocabs, col_names)]
+
+        for i, sample in enumerate(transposed):
+            rows = list(zip(*sample))
+
+            logging.info("")
+            logging.info(f"SAMPLE #{i + 1}")
+            self.display_row(col_names, col_widths)
+            for row in rows:
+                self.display_row(row, col_widths)
+
+    @staticmethod
+    def lexicalize(seq, vocab):
+        return [vocab.i2f[w] if w in vocab else "<unk>" for w in seq]
+
+    @staticmethod
+    def tighten(seqs, lens):
+        return [s[:l] for s, l in zip(seqs, lens)]
+
+    @staticmethod
+    def random_idx(max_count, subset=None):
+        idx = np.random.permutation(np.arange(max_count))
+
+        if subset is not None:
+            return idx[:subset]
+
+        return idx
+
+    @staticmethod
+    def gather(lst, idx):
+        return [lst[i] for i in idx]
+
+    def validate(self, epochs=None, iters=None, steps=None):
+        if not self.args.val:
+            return
+
+        logging.info("Validating...")
+        self.model.train(False)
+        nll_all = 0
+        preds_all, targets_all = [], []
+        data_size = 0
+        sampled = False
+
+        for i_idx, (batch, lens) in enumerate(self.val_data):
+            i_idx += 1
+            batch_size = batch.size(1)
+            data_size += batch_size
+
+            xs, y = batch[:-1], batch[-1]
+            xs_var, y_var, lens_s = self.prepare_batch(xs, y, lens,
+                                                       volatile=True)
+            loglik, logits = self.model.loglik(xs_var, y_var, lens_s,
+                                               return_logits=True)
+            nll = -loglik.mean()
+            nll_v = float(-(nll / lens_s.float()).data[0])
+
+            preds = self.model.predict(xs_var, lens_s)
+            preds = preds.cpu().data.tolist()
+            targets = y_var.cpu().data.tolist()
+            lens_s = lens_s.cpu().data.tolist()
+
+            preds = self.tighten(preds, lens_s)
+            targets = self.tighten(targets, lens_s)
+
+            preds_all.extend(preds)
+            targets_all.extend(targets)
+            nll_all = nll_v * batch_size
+
+            if not sampled and self.args.samples > 0:
+                sample_idx = self.random_idx(batch_size, self.args.samples)
+                xs = xs_var.cpu().data.tolist()
+                xs = [self.tighten(x, lens_s) for x in xs]
+                lstm = logits.max(2)[1]
+                lstm = lstm.cpu().data.tolist()
+                lstm = self.tighten(lstm, lens_s)
+
+                xs_smp = [self.gather(x, sample_idx) for x in xs]
+                y_smp = self.gather(targets, sample_idx)
+                crf_smp = self.gather(preds, sample_idx)
+                lstm_smp = self.gather(lstm, sample_idx)
+
+                self.display_samples(xs_smp, y_smp, lstm_smp, crf_smp)
+                del xs, lstm, xs_smp, y_smp, crf_smp, lstm_smp
+
+                sampled = True
+
+        nll = nll_all / data_size
+        preds_all = [self.lexicalize(s, self.label_vocab) for s in preds_all]
+        targets_all = [self.lexicalize(s, self.label_vocab)
+                       for s in targets_all]
+        preds_all = E.preprocess_labels(preds_all)
+        targets_all = E.preprocess_labels(targets_all)
+        prec, rec, f1 = E.compute_f1(preds_all, targets_all)
+
+        if self.args.tensorboard:
+            self.writer.add_scalar("val-neg-loglikelihood", nll,
+                                   global_step=steps)
+            self.writer.add_scalar("val-precision", prec, global_step=steps)
+            self.writer.add_scalar("val-recall", rec, global_step=steps)
+            self.writer.add_scalar("val-f1", f1, global_step=steps)
+
+        del preds_all, targets_all
+
+    def save_checkpoint(self, epochs=None, iters=None, steps=None):
+        logging.info("Saving checkpoint...")
+        if isinstance(self.model, nn.DataParallel):
+            module = self.model.module
+        else:
+            module = self.model
+        state_dict = module.state_dict()
+
+        if epochs is not None:
+            name = f"ckpt-e{epochs:02d}"
+        elif iters is not None:
+            name = f"ckpt-i{iters:06d}"
+        else:
+            name = f"ckpt-s{steps:08d}"
+
+        save_path = os.path.join(args.save_dir, name)
+        torch.save(state_dict, save_path)
+        logging.info(f"Checkpoint saved to '{save_path}'.")
+
+    def on_iter_complete(self, loss, local_iter, global_iter, global_step):
+        if self.args.tensorboard:
+            self.writer.add_scalar("neg-loglikelihood", loss,
+                                   global_step=global_step)
+
+        for period_checker, func in self.repeatables.items():
+            if period_checker(iters=global_iter, steps=global_step):
+                func(iters=global_iter, steps=global_step)
+
+    def on_epoch_complete(self, epoch_idx, global_iter, global_step):
+        for period_checker, func in self.repeatables.items():
+            if period_checker(epochs=epoch_idx,
+                              iters=global_iter,
+                              steps=global_step):
+                func(epochs=epoch_idx,
+                     iters=global_iter,
+                     steps=global_step)
 
 
-def viz_run(f_name, args=(), kwargs=dict()):
-    global viz
+def check_arguments(args):
+    num_inputs = len(args.input_path)
 
-    getattr(viz, f_name).__call__(*args, **kwargs)
+    assert num_inputs > 0, \
+        "At least one input file must be specified."
+
+    defaults = {
+        "wordembed-type": "none",
+        "wordembed-path": None,
+        "wordembed-freeze": False,
+        "word-dim": 300,
+    }
+
+    # default values for list type arguments
+    for attr, default in defaults.items():
+        attr_name = attr.replace("-", "_")
+        if getattr(args, attr_name) is None:
+            setattr(args, attr_name, [default] * num_inputs)
+
+    # check if input counts are correct
+    for attr in defaults:
+        attr_name = attr.replace("-", "_")
+        assert len(getattr(args, attr_name)) == num_inputs, \
+            f"--{attr} must be specified as many as inputs. " \
+            f"specified: {len(getattr(args, attr_name))}, required: {num_inputs}"
+
+    assert 0.0 < args.val_ratio < 1.0, \
+        "Specify a valid validation ratio."
+
+    # ensure that the save-dir exists
+    os.makedirs(args.save_dir, exist_ok=True)
 
 
-def _load_vocab(path):
-    with open(path, "rb") as f:
-        return pickle.load(f)
+def main(args):
+    logging.basicConfig(level=logging.INFO)
+    check_arguments(args)
 
+    logging.info("Creating vocabulary...")
+    input_vocabs = []
 
-def main():
-    args = parse_args()
+    for input in args.input_path:
+        vocab = utils.Vocabulary()
+        words = utils.FileReader(input).words()
+        vocab.add("<pad>")
+        utils.populate_vocab(words, vocab)
+        input_vocabs.append(vocab)
 
-    print("Loading vocabulary...")
-    feats_vocabs = [_load_vocab(path) for path in args.feats_vocab]
-    labels_vocab = _load_vocab(args.labels_vocab)
+    label_vocab = utils.Vocabulary()
+    label_vocab.add("<pad>")
+    words = utils.FileReader(args.label_path).words()
+    utils.populate_vocab(words, label_vocab)
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    save_basename = timestamp + "-{}".format(args.name)
-    save_dir = os.path.join(args.save_dir, save_basename)
+    for i, input_vocab in enumerate(input_vocabs):
+        vocab_path = os.path.join(args.save_dir,
+                                  f"vocab-input{i + 1:02d}.pkl")
+        pickle.dump(input_vocab, open(vocab_path, "wb"))
+    vocab_path = os.path.join(args.save_dir, f"vocab-label.pkl")
+    pickle.dump(label_vocab, open(vocab_path, "wb"))
 
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir, exist_ok=True)
-
-    print("Initializing model...")
-    model_cls = BiLSTMCRF
-    model = model_cls(feats_vocabs, labels_vocab, args.word_dim,
-                      args.hidden_dim,
-                      dropout_prob=args.dropout_prob)
-
+    logging.info("Initializing model...")
+    crf = M.CRF(len(label_vocab))
+    model = M.LSTMCRF(
+        crf=crf,
+        vocab_sizes=[len(v) for v in input_vocabs],
+        word_dims=args.word_dim,
+        hidden_dim=args.lstm_dim,
+        layers=args.lstm_layers,
+        dropout_prob=args.dropout_prob,
+        bidirectional=args.bidirectional
+    )
     model.reset_parameters()
+    if args.gpu:
+        gpu_main = args.gpu[0]
+        model = model.cuda(gpu_main)
+    params = sum(np.prod(p.size()) for p in model.parameters())
+    logging.info(f"Number of parameters: {params}")
 
-    print("Loading word embeddings...")
-
-    for i, (vocab, we_type, we_path, we_freeze) in \
-            enumerate(
-                zip(feats_vocabs, args.wordembed_type, args.wordembed_path,
-                    args.wordembed_freeze)):
-        embeddings = getattr(model, "embeddings_{}".format(i))
-
+    logging.info("Loading word embeddings...")
+    for vocab, we_type, we_path, we_freeze, emb in \
+            zip(input_vocabs, args.wordembed_type, args.wordembed_path,
+                args.wordembed_freeze, model.embeddings):
         if we_type == "glove":
-            load_glove_embeddings(embeddings, vocab, we_path)
+            assert we_path is not None
+            load_glove_embeddings(emb, vocab, we_path)
         elif we_type == "fasttext":
-            load_fasttext_embeddings(embeddings, vocab,
+            assert we_path is not None
+            assert args.fasttext_path is not None
+            load_fasttext_embeddings(emb, vocab,
                                      fasttext_path=args.fasttext_path,
                                      embedding_path=we_path)
         elif we_type == "none":
             pass
         else:
-            raise ValueError("Unrecognized word embedding type: {}".format(
-                we_type
-            ))
+            raise ValueError(f"Unrecognized word embedding "
+                             f"type: {we_type}")
 
         if we_freeze:
-            embeddings.weight.requires_grad = False
+            emb.weight.requires_grad = False
 
-    if args.gpu:
-        model = model.cuda()
+    # Copying configuration file to save directory if config file is specified.
+    if args.config:
+        config_path = os.path.join(args.save_dir, os.path.basename(args.config))
+        shutil.copy(args.config, config_path)
 
-    viz_pool = mp.ThreadPool(1, initializer=init_viz, initargs=(tuple(), dict(
-        buffer_size=args.visdom_buffer_size,
-        server="http://{}".format(args.visdom_host),
-        port=args.visdom_port,
-        env=args.name,
-        name=timestamp
-    )))
-
-    viz_pool.apply_async(viz_run, ("code", tuple(), dict(
-        text=str(args)[10:-1].replace(", ", "\n"),
-        opts=dict(
-            title="Arguments"
+    def create_dataloader(dataset):
+        return D.MultiSentWordDataLoader(
+            dataset=dataset,
+            vocabs=input_vocabs + [label_vocab],
+            batch_size=args.batch_size,
+            shuffle=args.shuffle,
+            tensor_lens=True,
+            num_workers=len(args.gpu) if args.gpu is not None else 1,
+            pin_memory=True
         )
-    )))
 
-    config_path = os.path.join(save_dir, os.path.basename(args.config))
-    shutil.copy(args.config, config_path)
+    dataset = D.MultiSentWordDataset(*args.input_path, args.label_path)
 
-    def _data_loader_fn_generator(feats_vocabs, labels_vocab, feats_paths,
-                                  labels_path):
-        def _data_loader_fn():
-            feats_preps = [Preprocessor(vocab, add_bos=False, add_eos=False)
-                           for vocab in feats_vocabs]
-            labels_prep = Preprocessor(labels_vocab,
-                                       add_bos=False, add_eos=False)
-            feats_readers = [TextFileReader(path) for path in feats_paths]
-            labels_reader = TextFileReader(labels_path)
+    if args.val:
+        vr = args.val_ratio
+        train_dataset, val_dataset = dataset.split(1 - vr, vr,
+                                                   shuffle=args.shuffle)
+    else:
+        train_dataset, val_dataset = dataset, None
 
-            feats_gen = [SentenceGenerator(reader, vocab, args.batch_size,
-                                           max_length=args.max_len,
-                                           preprocessor=prep,
-                                           allow_residual=True)
-                         for reader, vocab, prep in
-                         zip(feats_readers, feats_vocabs, feats_preps)]
-            labels_gen = SentenceGenerator(labels_reader, labels_vocab,
-                                           args.batch_size,
-                                           max_length=args.max_len,
-                                           preprocessor=labels_prep,
-                                           allow_residual=True,)
+    train_dataloader = create_dataloader(train_dataset)
 
-            return feats_gen + [labels_gen]
+    if val_dataset is not None:
+        val_dataloader = create_dataloader(val_dataset)
+    else:
+        val_dataloader = None
 
-        return _data_loader_fn
+    logging.info("Beginning training...")
+    trainer = LSTMCRFTrainer(
+        sargs=args,
+        input_vocabs=input_vocabs,
+        label_vocab=label_vocab,
+        val_data=val_dataloader,
+        model=model,
+        epochs=args.epochs,
+        gpus=args.gpu
+    )
+    trainer.train(train_dataloader,
+                  data_size=len(train_dataset))
 
-    _data_loader_fn = _data_loader_fn_generator(feats_vocabs=feats_vocabs,
-                                                labels_vocab=labels_vocab,
-                                                feats_paths=args.feats_path,
-                                                labels_path=args.labels_path)
-    _val_data_loader_fn = _data_loader_fn_generator(feats_vocabs=feats_vocabs,
-                                                    labels_vocab=labels_vocab,
-                                                    feats_paths=args.val_feats_path,
-                                                    labels_path=args.val_labels_path)
-
-    print("Beginning training...")
-    train(model,
-          data_loader_fn=_data_loader_fn,
-          val_data_loader_fn=_val_data_loader_fn,
-          n_epochs=args.n_epochs,
-          viz_pool=viz_pool,
-          save_dir=save_dir,
-          n_previews=args.n_previews,
-          save_period=args.save_period,
-          val_enabled=args.val,
-          val_period=args.val_period,
-          preview_enabled=args.text_preview,
-          save_enabled=args.save)
-
-    # Flush remaining buffer
-    viz_run("flush", tuple(), dict())
-
-    print("Done!")
+    logging.info("Done!")
 
 
 if __name__ == '__main__':
-    main()
+    args = parser.parse_args()
+    if args.tensorboard:
+        import tensorboard as T
+    main(args)
