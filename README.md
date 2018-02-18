@@ -4,6 +4,8 @@ An efficient BiLSTM-CRF implementation that leverages mini-batch operations on m
 
 Tested on the latest PyTorch Version (0.3.0) and Python 3.5+.
 
+The latest training code utilizes GPU better and provides options for data parallization across multiple GPUs using `torch.nn.DataParallel` functionality.
+
 ## Requirements ##
 
 Install all required packages (other than pytorch) from `requirements.txt`
